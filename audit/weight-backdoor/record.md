@@ -121,15 +121,9 @@ python backdoor_poc.py
 
 ## For a bounty submission (public HuggingFace repo)
 
-The form asks for a PoC uploaded to a public HF repo. Upload the file and a
-loader snippet, e.g.:
-
-```
-huggingface-cli repo create st-weight-backdoor-poc --type model
-huggingface-cli upload st-weight-backdoor-poc backdoor.safetensors
-```
-
-Then the report is: load `backdoor.safetensors` into the 9-hidden-unit MLP,
-feed any input with feature 15 set to 1.0, and observe it always classifies as
-class 2 while behaving normally otherwise — with the file passing all
-format-level safetensors validation.
+See `REPORT.md` for the full submission writeup and HuggingFace upload steps
+covering all three formats — `backdoor.safetensors`, `backdoor.pt` (pickle),
+and `backdoor.gguf`. In short: create a public model repo, upload the PoC
+file(s) + `backdoor_poc.py`, then the repro is "load into the 9-hidden-unit
+MLP, set input feature 15 = 1.0, observe forced class 2" while the file passes
+all format-level validation.
