@@ -59,6 +59,43 @@ Rust standalone (`trigger_rust.rs`), both profiles:
   gracefully rejected: incomplete metadata, file not fully covered
 ```
 
+## Release-mode verification (can the overflow be turned into a release panic?)
+
+The debug panic is not the worst case. In **release** the add wraps silently,
+so the real question is: can a crafted file make the *wrapped* sum **equal**
+`buffer_len`, so the check **passes**, letting the astronomical offsets reach an
+out-of-bounds slice in `deserialize`/`tensors()` — a panic that *does* fire in
+release (slice indexing is always bounds-checked)?
+
+**Answer: no. It is arithmetically impossible.** Writing `buffer_len = N_LEN + n + D`
+(`D` = appended data bytes ≥ 0), the check `(buffer_end + N_LEN + n) mod 2^64 == buffer_len`
+has only two solution families:
+
+- **No wrap:** `buffer_end == D` — the *legitimate* fully-covered file. Every
+  offset is then within the data section, so downstream slicing is in-bounds.
+- **Wrap:** requires `buffer_end == 2^64 + D`, i.e. `buffer_end >= 2^64`. But
+  `buffer_end` is a `usize` capped at `2^64 - 1` (offsets are `usize`; a JSON
+  offset of `2^64` fails to parse). So a wrapping pass can never be constructed.
+
+Equivalently: at the maximum `buffer_end = 2^64 - 1`, the wrapped value is
+`7 + n`, while the file must be at least `8 + n` bytes — off by exactly 1, a gap
+that cannot be closed (you cannot ship a buffer smaller than its own header).
+
+This was verified three ways (`verify_release.rs`, built `--release`):
+
+- **Real deserialize sweep** — `buffer_end = u64::MAX`, sweeping `n` (header
+  whitespace padding) and `buffer_len` (0..300 appended bytes):
+  `panics=0  accepted(bypass)=0  rejected=2107`, closest `|wrapped - buffer_len| = 1`.
+- **Arithmetic Monte Carlo** — 20M random `(buffer_end ≤ u64::MAX, n ≤ 1e8, D)`:
+  `WRAP-to-pass = 0`.
+- **Release Python binding** (`maturin develop --release`) — the exact input
+  that panics in debug now returns a normal
+  `SafetensorError: incomplete metadata, file not fully covered` (no
+  `PanicException`).
+
+So the impact is confined to `overflow-checks` builds (a controlled panic);
+release wheels reject uniformly with no bypass and no downstream out-of-bounds.
+
 ## Defense-in-depth note (case 4)
 
 A single `shape=[u64::MAX]` `I64` tensor is rejected earlier by
@@ -75,6 +112,10 @@ independently.
   `SafeTensors::deserialize`; run under `cargo run` (debug: panic) and
   `cargo run --release` (graceful reject). Standalone-crate setup as in the
   other Rust triggers (dep `safetensors = { path = ".../safetensors" }`).
+- `verify_release.rs` — the release-mode verification harness: a real
+  deserialize sweep at `buffer_end = u64::MAX` plus a 20M-sample arithmetic
+  Monte Carlo, asserting no wrap-to-pass and no panic. Run with
+  `cargo run --release` (same standalone-crate setup).
 
 ## Suggested fix (not applied)
 
