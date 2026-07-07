@@ -65,8 +65,48 @@ there; the backdoor is invisible unless you know the trigger.
   weight statistics look normal (`[5]`). Detection requires behavioral analysis
   with knowledge of (or search for) the trigger — not a format property.
 
+## Portability across formats (not specific to safetensors)
+
+The backdoor lives in the **weights**, not the container, so it rides
+identically in any format that round-trips the tensors. `portability_demo.py`
+exports the *same* backdoored `state_dict` to safetensors, pickle (`.pt`), and
+GGUF, reloads each, and compares:
+
+```
+format          size(B)  max|w-diff|  trigger→target   extra attack surface
+safetensors        1004    0.000e+00          100.0%   none
+pickle (.pt)       2923    0.000e+00          100.0%   ARBITRARY CODE EXEC on load
+gguf               1056    0.000e+00          100.0%   no code-exec; parser CVEs + metadata/template surface
+```
+
+Identical weights (`max|w-diff| = 0`) and identical backdoor (100% forced
+target) in all three. The formats differ **only** in the surface they add *on
+top* of the weights:
+
+- **safetensors** — adds nothing; pure data, the minimal/safest container.
+- **pickle** — additionally executes arbitrary code on load (`__reduce__`); it
+  carries the same weight backdoor *plus* an ACE vector. Strictly worse.
+- **GGUF** — pure-data by spec (no code-exec), but historically has had parser
+  memory-safety CVEs, and its metadata KV (chat templates, tokenizer) is a
+  separate behavioral-manipulation channel.
+
+Takeaway: switching container format (e.g. pickle → safetensors) removes the
+*code-execution* surface but does nothing about weight-encoded backdoors — that
+risk is format-independent, and safetensors' "safe" reputation can lull
+defenders into skipping the behavioral review that would catch it.
+
+Note on the PoC's extra neuron: it changes hidden dim 8→9, which only matters
+when the loader instantiates the matching shape (e.g. `from_pretrained` driven
+by `config.json`). Against a fixed architecture, the same backdoor is instead
+fit within the existing parameter shapes (data-poisoning / weight-editing,
+BadNets-style) — equally format-agnostic.
+
 ## Files
 
+- `portability_demo.py` — exports the backdoor to safetensors/pickle/GGUF and
+  verifies identical weights + trigger behaviour across all three. Requires the
+  `gguf` package (`uv pip install gguf`). Regenerates `bd.safetensors`,
+  `bd.pt`, `bd.gguf`.
 - `backdoor_poc.py` — builds clean + backdoored models, proves identical normal
   behavior, demonstrates the trigger, round-trips through safetensors, and
   prints what a scanner sees. Deterministic (`torch.manual_seed(0)`).
