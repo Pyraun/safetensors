@@ -22,6 +22,8 @@ inherent-to-any-weight-format concerns.
 |---|---|---|---|
 | `slice-reversed-bounds-overflow/` | Reversed slice bounds (`start > stop`) underflow in `slice_byte_ranges` → panic | Python `get_slice[hi:lo]` **and** Rust `view.slice(10..3)` | Low (DoS / crash) |
 | `slice-usize-max-bound-overflow/` | Slice bound at `usize::MAX` overflows `narrow_bounds` `*s + 1` → panic | Rust inclusive range `view.slice(..=usize::MAX)` (not Python) | Low (DoS / crash) |
+| `buffer-length-overflow/` | `buffer_end + N_LEN + n` unchecked add overflows → panic in `overflow-checks` builds (no logic bypass; release wheels reject gracefully) | `deserialize()`/`load()` via crafted offsets summing to `usize::MAX` | Low (DoS in debug/overflow-checks builds only) |
+| `dos-vectors/` | Metadata amplification: valid ~100 MB header (~1.3M tensors) → ~11–25 s + ~1–2 GB RAM (~13–19× file). Other DoS ideas mitigated. | `deserialize()`/`load_file()` | Low–med (resource exhaustion, no tiny-file amplification) |
 
 Both were found by the `fuzz_slice` cargo-fuzz target added in this branch
 (`safetensors/fuzz/fuzz_targets/fuzz_slice.rs`). Root cause is shared: the
@@ -34,10 +36,6 @@ These are on the to-do list but not yet exercised with test files:
 
 - **Weight-encoded backdoor PoC** — valid, scanner-clean file whose weights
   encode a trigger→malicious-output backdoor (bounty "Backdoor" category).
-- **DoS vectors** — 100 MB header parse cost; high-dimensionality reshape;
-  huge single offset (no amplification expected).
-- **Integer-overflow logic bypass** on the `buffer_end + N_LEN + n` check
-  (`tensor.rs:420`) — static analysis says unreachable; to confirm.
 - **Mutable-bytearray aliasing / BOOL byte quirk** in `deserialize`/`load`.
 - **`load_model` `__metadata__` key remapping** review.
 - **Polyglot / trailing-data scanner evasion** (expected: rejected by
