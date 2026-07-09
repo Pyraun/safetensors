@@ -21,9 +21,11 @@ Two independent integer-overflow bugs in the `safetensors` Rust core cause the
 library to **panic** (Rust) / raise an unexpected fatal error (Python), rather
 than returning an error, on certain inputs:
 
-1. **Reversed / extreme slice bounds** in `slice::slice_byte_ranges` — reachable
-   from `safe_open(...).get_slice(name)[hi:lo]` (Python) and `TensorView::slice`
-   (Rust). **Reproduces in release builds.**
+1. **Reversed slice bounds** (`start > stop`) in `slice::slice_byte_ranges` —
+   reachable from `safe_open(...).get_slice(name)[hi:lo]` (Python) and
+   `TensorView::slice` (Rust). **Reproduces in release builds.** (A sibling
+   `usize::MAX`-index overflow in the same function is already handled by pending
+   PR #809 and is excluded here.)
 2. **Header buffer-length check** in `tensor::read_metadata` — reachable from
    `deserialize()` / `load()` on a crafted file whose tensor offsets sum to
    `usize::MAX`. **Panics only in `overflow-checks` builds**; release wheels
@@ -35,7 +37,7 @@ bypass.
 
 ---
 
-## Bug 1 — Reversed/extreme slice bounds panic (`src/slice.rs`)
+## Bug 1 — Reversed slice bounds panic (`src/slice.rs`)
 
 ### Description
 
@@ -54,15 +56,22 @@ newshape.push((stop - start).div_ceil(step));      // underflow when start > sto
 // ... and the analogous (stop * span) / 8 - offset at src/slice.rs:390
 ```
 
-Separately, `narrow_bounds` (`src/slice.rs:320`, `:324`) does `*s + 1` on a
-bound without overflow checking, so a bound of `usize::MAX` overflows.
+> **Note — a sibling overflow is already being fixed.** `narrow_bounds`
+> (`src/slice.rs:320`, `:324`) and `Select` (`:357`) also do `*s + 1` without
+> overflow checking, so a `usize::MAX` index overflows. That specific sub-issue
+> is addressed by pending upstream PR
+> [#809](https://github.com/safetensors/safetensors/pull/809) ("Guard slice
+> bound resolution against index overflow", `saturating_add`). **This advisory
+> excludes it** and covers only the reversed-bounds (`start > stop`) case, which
+> PR #809 does **not** fix — its `saturating_add` leaves the `stop - start`
+> underflow at `:377` intact, so the panic below still reproduces with #809
+> applied.
 
 ### Reachability & build-profile behavior
 
 | Input | Debug / `overflow-checks` | **Release (published wheels)** |
 |---|---|---|
 | `get_slice(name)[10:3]` (reversed) | panic `attempt to subtract with overflow` @ `slice.rs:377` | subtraction wraps → inverted byte range `(40, 12)` → `SliceIterator::next` does `data()[40..12]` → **panic `slice index starts at 40 but ends at 12` @ `slice.rs:440`**. Via the numpy binding: **`SystemError: Negative size passed to PyByteArray_FromStringAndSize`**. |
-| `view.slice(..=usize::MAX)` (Rust) | panic `attempt to add with overflow` @ `slice.rs:324` | wraps to `0` → empty selection (no panic) |
 
 Reachable from the numpy/tf/flax/mlx byte-slice path and the Rust crate API;
 also the torch/paddle path under `backend="pread"`. Every other Python slicing
@@ -93,9 +102,10 @@ panics `slice index starts at 40 but ends at 12` in `--release`.
 
 In `slice_byte_ranges`, treat `start >= stop` as an empty selection (push a `0`
 extent to `newshape` and an empty byte range), matching Python slice semantics,
-and use checked/saturating arithmetic in `narrow_bounds` (`checked_add(1)`,
-saturating to `dim`) and for the `start*span` / `stop*span` computations. Keep
-the existing `SliceOutOfRange` error for `start > dim`.
+and use checked/saturating arithmetic for the `start*span` / `stop*span`
+computations. Keep the existing `SliceOutOfRange` error for `start > dim`.
+(PR #809's `saturating_add` in `narrow_bounds`/`Select` is complementary but
+does **not** cover `start > stop`, so this fix is still required on top of it.)
 
 ---
 
@@ -192,6 +202,13 @@ Found by a `cargo-fuzz` target (`fuzz_slice`) that crosses a validated
 `TensorView` with arbitrary `TensorIndexer` sequences; both slice panics were
 found within seconds. The buffer-length overflow was found while verifying the
 `read_metadata` coverage check.
+
+## Related / prior art
+
+- PR [#809](https://github.com/safetensors/safetensors/pull/809) — "Guard slice
+  bound resolution against index overflow" (open, not merged as of upstream
+  `main` @ `6eb4dc9`). Fixes the sibling `usize::MAX`-index `*s + 1` overflow via
+  `saturating_add`; does **not** address Bug 1's reversed-bounds case or Bug 2.
 
 ## References
 

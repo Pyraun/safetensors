@@ -1,5 +1,14 @@
 # Slice bound at `usize::MAX` overflows `narrow_bounds`
 
+> **STATUS: already being fixed upstream — do NOT disclose (duplicate).**
+> Pending PR [#809](https://github.com/safetensors/safetensors/pull/809)
+> ("Guard slice bound resolution against index overflow") fixes exactly this via
+> `saturating_add` in `narrow_bounds`/`Select`, and adds regression tests for
+> `Select`, `Excluded(usize::MAX)` start, and `Included(usize::MAX)` stop. Not
+> merged as of upstream `main` @ `6eb4dc9`, but it supersedes this finding.
+> Retained here for completeness only. (PR #809 does **not** fix the reversed-
+> bounds panic in `../slice-reversed-bounds-overflow/` — that one is still live.)
+
 - **Component:** core crate — `safetensors/src/slice.rs` (`narrow_bounds`)
 - **Reachable from:** Rust `TensorView::slice(..=usize::MAX)` (inclusive range). **Not** reachable from the Python bindings.
 - **Class:** integer-overflow panic → Denial of Service / unexpected crash
