@@ -35,9 +35,16 @@ reversed slice as a **benign empty selection**; safetensors instead panics.
   immediate panic `attempt to subtract with overflow` at `slice.rs:377`,
   surfaced through PyO3 as `pyo3_runtime.PanicException`.
 - **Release wheels (`overflow-checks` off):** the subtraction wraps to a huge
-  `usize`, flows into the byte-range math, and finally
-  `SliceIterator::next` does `data()[start..stop]` with an out-of-bounds
-  `stop` → slice-index panic. Still a crash/exception, just at a later site.
+  `usize`, producing an inverted byte range `(40, 12)`; `SliceIterator::next`
+  then does `data()[40..12]` → **panic `slice index starts at 40 but ends at
+  12` at `slice.rs:440`** (an out-of-bounds slice, which is bounds-checked in
+  release too). Via the numpy binding the wrapped length hits
+  `PyByteArray_FromStringAndSize` first and surfaces as
+  **`SystemError: Negative size passed to PyByteArray_FromStringAndSize`**.
+  **Verified in release** (both the Rust API and a `maturin develop --release`
+  binding) — this is the slicing case that triggers in release, and is packaged
+  as a HuggingFace submission (`slice_panic.safetensors`, `repro.py`,
+  `REPORT.md`).
 
 ## Trigger / test files
 
@@ -46,6 +53,11 @@ reversed slice as a **benign empty selection**; safetensors instead panics.
   equivalent `arr[10:3]` returns an empty array.
 - `trigger_rust.rs` — the same bug from the Rust API via `view.slice(10..3)`.
   Build as a standalone crate (see the header comment in the file).
+- `slice_panic.safetensors` — a valid PoC model file (loads normally) for the
+  HuggingFace submission; sliced with `[10:3]` it triggers the release panic.
+- `repro.py` — loads `slice_panic.safetensors` and slices `[10:3]`; prints the
+  release-mode `SystemError`. See `REPORT.md` for the submission writeup + HF
+  upload steps.
 - `../../safetensors/fuzz/fuzz_targets/fuzz_slice.rs` — the fuzz target that
   discovered it (structured input:
   `dtype=C64, dims=[255,33], indexers=[Narrow(Excluded(_), Excluded(0), _)]`,
