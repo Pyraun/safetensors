@@ -1,15 +1,21 @@
-# Security Advisory — Integer-overflow panics (DoS) in `safetensors`
+# Security Advisory — Integer-overflow panics (Denial of Service) in `safetensors`
 
-> Draft for a GitHub Security Advisory on `huggingface/safetensors`. The fields
-> below map to the "New draft security advisory" form; the prose beneath is the
-> advisory body. Discovered via a `cargo-fuzz` target for the slicing path.
+**Reporter:** _<your name / contact>_
+**Date:** _<fill in>_
+**Repository:** `safetensors/safetensors` (`huggingface/safetensors` redirects here)
+**Status:** private disclosure to the maintainers' security team
+
+This is a self-contained report; every proof of concept below is inlined and
+runnable without any additional files. It also maps cleanly onto a GitHub
+"New draft security advisory" (the metadata table = the form fields; the prose
+= the advisory body).
 
 ## Advisory metadata
 
 | Field | Value |
 |---|---|
 | **Ecosystem / package** | crates.io — `safetensors` (Rust); also affects the PyPI `safetensors` Python bindings, which wrap the same crate |
-| **Affected versions** | Current `main` (crate `0.9.0-dev.0`) and prior releases exposing `TensorView::slice` / `SafeTensors::read_metadata` — the affected code paths (`slice::slice_byte_ranges`, `tensor::read_metadata`) are long-standing; maintainers to confirm the exact released range |
+| **Affected versions** | Current `main` (crate `0.9.0-dev.0`) and prior releases exposing `TensorView::slice` / `SafeTensors::read_metadata`. The affected code paths (`slice::slice_byte_ranges`, `tensor::read_metadata`) are long-standing; maintainers to confirm the exact released range. |
 | **Patched versions** | _to be assigned_ |
 | **Severity** | Low (Denial of Service; no memory corruption, no code execution, no data disclosure) |
 | **CVSS v3.1 (estimate)** | `AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L` = **3.3 Low** (raise `AV:N` → 4.0 where model files / slice bounds arrive over a network boundary) |
@@ -19,13 +25,12 @@
 
 Two independent integer-overflow bugs in the `safetensors` Rust core cause the
 library to **panic** (Rust) / raise an unexpected fatal error (Python), rather
-than returning an error, on certain inputs:
+than returning an `Err`, on certain inputs:
 
 1. **Reversed slice bounds** (`start > stop`) in `slice::slice_byte_ranges` —
    reachable from `safe_open(...).get_slice(name)[hi:lo]` (Python) and
-   `TensorView::slice` (Rust). **Reproduces in release builds.** (A sibling
-   `usize::MAX`-index overflow in the same function is already handled by pending
-   PR #809 and is excluded here.)
+   `TensorView::slice` (Rust). **Reproduces in release builds** (published
+   wheels).
 2. **Header buffer-length check** in `tensor::read_metadata` — reachable from
    `deserialize()` / `load()` on a crafted file whose tensor offsets sum to
    `usize::MAX`. **Panics only in `overflow-checks` builds**; release wheels
@@ -35,14 +40,18 @@ Both are Denial-of-Service only. There is no out-of-bounds read/write beyond a
 Rust-checked slice panic, no code execution, and (for bug 2) no validation
 bypass.
 
+A related, in-flight PR (#809) fixes a *sibling* overflow in the same slicing
+function but does **not** address either bug here; see "Relationship to PR #809"
+below, where we propose the additional one-line fix that closes Bug 1.
+
 ---
 
 ## Bug 1 — Reversed slice bounds panic (`src/slice.rs`)
 
 ### Description
 
-`slice_byte_ranges` resolves each dimension's `(start, stop)` in `narrow_bounds`
-and range-checks it at `src/slice.rs:363`:
+`slice_byte_ranges` resolves each dimension's `(start, stop)` and range-checks
+it (in current `main`, around `src/slice.rs:363`):
 
 ```rust
 if start >= dim || stop > dim { return Err(InvalidSlice::SliceOutOfRange { .. }); }
@@ -56,56 +65,97 @@ newshape.push((stop - start).div_ceil(step));      // underflow when start > sto
 // ... and the analogous (stop * span) / 8 - offset at src/slice.rs:390
 ```
 
-> **Note — a sibling overflow is already being fixed.** `narrow_bounds`
-> (`src/slice.rs:320`, `:324`) and `Select` (`:357`) also do `*s + 1` without
-> overflow checking, so a `usize::MAX` index overflows. That specific sub-issue
-> is addressed by pending upstream PR
-> [#809](https://github.com/safetensors/safetensors/pull/809) ("Guard slice
-> bound resolution against index overflow", `saturating_add`). **This advisory
-> excludes it** and covers only the reversed-bounds (`start > stop`) case, which
-> PR #809 does **not** fix — its `saturating_add` leaves the `stop - start`
-> underflow at `:377` intact, so the panic below still reproduces with #809
-> applied.
-
 ### Reachability & build-profile behavior
 
 | Input | Debug / `overflow-checks` | **Release (published wheels)** |
 |---|---|---|
-| `get_slice(name)[10:3]` (reversed) | panic `attempt to subtract with overflow` @ `slice.rs:377` | subtraction wraps → inverted byte range `(40, 12)` → `SliceIterator::next` does `data()[40..12]` → **panic `slice index starts at 40 but ends at 12` @ `slice.rs:440`**. Via the numpy binding: **`SystemError: Negative size passed to PyByteArray_FromStringAndSize`**. |
+| `get_slice(name)[10:3]` (reversed) | panic `attempt to subtract with overflow` @ `slice.rs:377` | subtraction wraps → inverted byte range `(40, 12)` → `SliceIterator::next` does `data()[40..12]` → **panic `slice index starts at 40 but ends at 12` @ `slice.rs:440`**. Via the numpy binding this surfaces as **`SystemError: Negative size passed to PyByteArray_FromStringAndSize`** (the wrapped length becomes a negative `ssize_t`). |
 
-Reachable from the numpy/tf/flax/mlx byte-slice path and the Rust crate API;
-also the torch/paddle path under `backend="pread"`. Every other Python slicing
-API (`list`, numpy, torch) treats a reversed slice as a benign empty selection.
+Reachable from the numpy / tensorflow / flax / mlx byte-slice path and the Rust
+crate API; also the torch / paddle path under `backend="pread"`. Every other
+Python slicing API (`list`, numpy, torch) treats a reversed slice as a benign
+empty selection.
 
-Note: the slice bounds come from the **caller**, not the file, so a plain
+Scope note: the slice bounds come from the **caller**, not the file, so a plain
 `load_file` does not trigger this. Impact lands on code that slices with
 computed bounds where `start` can exceed `stop` (windowing, sharding,
 negative-index arithmetic).
 
-### Proof of concept
+### Proof of concept (self-contained)
 
 ```python
+# pip install safetensors numpy      (a stock release wheel is enough)
 import numpy as np
 from safetensors.numpy import save_file
 from safetensors import safe_open
 
 save_file({"weight": np.zeros((16, 16), dtype=np.float32)}, "m.safetensors")
-np.zeros((16, 16))[10:3]                        # numpy: (0, 16), no error
+print(np.zeros((16, 16))[10:3].shape)              # numpy: (0, 16) — benign empty, no error
 with safe_open("m.safetensors", framework="np") as f:
-    f.get_slice("weight")[10:3]                 # safetensors: crashes (release too)
+    f.get_slice("weight")[10:3]                    # safetensors: crashes (release too)
 ```
 
-Rust: `TensorView::new(Dtype::F32, vec![16], &data).unwrap().slice(10..3)`
-panics `slice index starts at 40 but ends at 12` in `--release`.
+Expected (release wheel): the process raises
+`SystemError: Negative size passed to PyByteArray_FromStringAndSize` and exits
+non-zero.
+
+Rust equivalent (panics `slice index starts at 40 but ends at 12` under
+`--release`):
+
+```rust
+use safetensors::slice::IndexOp;
+use safetensors::tensor::{Dtype, TensorView};
+let data = vec![0u8; 16 * 4];                       // 16 x F32
+let view = TensorView::new(Dtype::F32, vec![16], &data).unwrap();
+let _ = view.slice(10..3).map(|it| it.count());     // 10..3 -> start=10, stop=3
+```
 
 ### Suggested fix
 
-In `slice_byte_ranges`, treat `start >= stop` as an empty selection (push a `0`
-extent to `newshape` and an empty byte range), matching Python slice semantics,
-and use checked/saturating arithmetic for the `start*span` / `stop*span`
-computations. Keep the existing `SliceOutOfRange` error for `start > dim`.
-(PR #809's `saturating_add` in `narrow_bounds`/`Select` is complementary but
-does **not** cover `start > stop`, so this fix is still required on top of it.)
+Treat `start >= stop` as an empty selection (matching Python slice semantics)
+before the subtraction. The minimal, robust fix is to clamp `stop` up to
+`start` immediately after the bounds are resolved, so a reversed range becomes a
+zero-length selection instead of underflowing:
+
+```rust
+            let (start, stop, step) = match slice {
+                TensorIndexer::Select(s) => (*s, s.saturating_add(1), 1),
+                TensorIndexer::Narrow(left, right, step) => {
+                    let (start, stop) = narrow_bounds(left, right, dim);
+                    (start, stop, step.get())
+                }
+            };
++           // A reversed range (start > stop) is an empty selection in every
++           // other slicing API (list/numpy/torch). Clamp so it yields an empty
++           // result instead of underflowing `stop - start` / `stop*span` below.
++           let stop = stop.max(start);
+            if start >= dim || stop > dim {
+                // existing SliceOutOfRange handling
+            }
+```
+
+With this clamp, `newshape` gets a `0` extent for that dimension and the byte
+range collapses to empty — the caller receives an empty tensor, exactly like
+numpy/torch. The existing `SliceOutOfRange` error for `start > dim` is
+preserved. (Verified: the clamp makes `[10:3]` return empty in both debug and
+release.)
+
+### Relationship to PR #809
+
+Upstream PR **[#809](https://github.com/safetensors/safetensors/pull/809)**
+("Guard slice bound resolution against index overflow", open, not merged as of
+`main` @ `6eb4dc9`) fixes a *sibling* overflow — the `*s + 1` in `narrow_bounds`
+/ `Select` when an index is `usize::MAX` — by switching to `saturating_add`.
+That change is good and orthogonal, but it does **not** fix this bug: we built
+the crate at PR #809's commit and confirmed `view.slice(10..3)` still panics in
+release (`slice index starts at 40 but ends at 12`), because the `stop - start`
+underflow is untouched. **We recommend the one-line `let stop = stop.max(start);`
+clamp above be added to PR #809** (same function, same author's context): #809's
+`saturating_add` already closes the `usize::MAX`-index case, and the clamp closes
+the reversed-bounds case, so the amended PR fixes both in one place. We verified
+the combination on PR #809's code — in both debug and release, `[10:3]` returns
+an empty tensor, `..=usize::MAX` returns `SliceOutOfRange`, and normal slices are
+unaffected.
 
 ---
 
@@ -114,7 +164,7 @@ does **not** cover `start > stop`, so this fix is still required on top of it.)
 ### Description
 
 `SafeTensors::read_metadata` validates that the declared tensor data exactly
-covers the buffer at `src/tensor.rs:420`:
+covers the buffer (current `main`, `src/tensor.rs:420`):
 
 ```rust
 if buffer_end + N_LEN + n != buffer_len {
@@ -146,12 +196,13 @@ panic even in release). This is **impossible**: a wrapping pass requires
 `buffer_end >= 2^64`, but `buffer_end` is a `usize` capped at `2^64 - 1` while
 the buffer must be at least `N_LEN + n` bytes. Confirmed with a real
 `--release` deserialize sweep (`panics=0, bypass=0, closest gap = 1 byte`) and a
-20M-sample arithmetic Monte Carlo (`wrap-to-pass = 0`). So release wheels are
-not affected; only `overflow-checks` builds panic.
+20-million-sample arithmetic Monte Carlo (`wrap-to-pass = 0`). So release wheels
+are not affected; only `overflow-checks` builds panic.
 
-### Proof of concept
+### Proof of concept (self-contained)
 
 ```python
+# Reproduces on an overflow-checks build (e.g. `maturin develop`, cargo test).
 import json, struct
 from safetensors import deserialize
 
@@ -186,35 +237,43 @@ This makes every build profile reject uniformly instead of panicking under
 Denial of Service. An application that (bug 1) slices safetensors tensors with
 caller-computed bounds that can invert, or (bug 2) parses untrusted model files
 in an `overflow-checks`-enabled build, can be crashed by an unexpected
-panic/fatal error. No memory corruption, code execution, or data disclosure.
+panic / fatal error. No memory corruption, code execution, or data disclosure.
 
 ## Workarounds
 
-- **Bug 1:** callers should clamp slice bounds so `start <= stop` (and `stop <=
-  dim`) before calling `get_slice(...)[...]`, treating reversed ranges as empty.
-- **Bug 2:** build/ship in `--release` without `overflow-checks` (the default
-  for published wheels) — release wheels already reject the crafted file
-  gracefully. To also harden `overflow-checks` builds, apply the fix above.
+- **Bug 1:** callers should clamp slice bounds so `start <= stop` (and
+  `stop <= dim`) before calling `get_slice(...)[...]`, treating reversed ranges
+  as empty.
+- **Bug 2:** ship in `--release` without `overflow-checks` (the default for
+  published wheels) — release wheels already reject the crafted file gracefully.
+  To also harden `overflow-checks` builds, apply the fix above.
 
-## Detection / discovery
+## Reproducing from scratch
 
-Found by a `cargo-fuzz` target (`fuzz_slice`) that crosses a validated
-`TensorView` with arbitrary `TensorIndexer` sequences; both slice panics were
-found within seconds. The buffer-length overflow was found while verifying the
-`read_metadata` coverage check.
+```bash
+# Python (Bug 1 on any release wheel; Bug 2 needs an overflow-checks build)
+pip install safetensors numpy          # release wheel: Bug 1 crashes, Bug 2 rejects gracefully
+# To also observe Bug 2's panic, build with overflow-checks on:
+#   git clone https://github.com/safetensors/safetensors && cd safetensors/bindings/python
+#   maturin develop                    # debug build -> overflow-checks on
 
-## Related / prior art
+# Rust core (both bugs, both profiles)
+git clone https://github.com/safetensors/safetensors && cd safetensors/safetensors
+cargo test        # debug: overflow-checks on
+# build a small bin against the crate and run with --release to see release behavior
+```
 
-- PR [#809](https://github.com/safetensors/safetensors/pull/809) — "Guard slice
-  bound resolution against index overflow" (open, not merged as of upstream
-  `main` @ `6eb4dc9`). Fixes the sibling `usize::MAX`-index `*s + 1` overflow via
-  `saturating_add`; does **not** address Bug 1's reversed-bounds case or Bug 2.
+## Discovery
 
-## References
+Bug 1 was found by a `cargo-fuzz` target that crosses a validated `TensorView`
+with arbitrary `TensorIndexer` sequences (reversed and extreme bounds); it
+surfaced within seconds. Bug 2 was found while auditing the `read_metadata`
+buffer-coverage check for overflow.
+
+## References (source locations, current `main`)
 
 - `src/slice.rs` — `narrow_bounds` (`:316`), `slice_byte_ranges` (`:363`, `:377`,
   `:390`), `SliceIterator::next` (`:440`)
 - `src/tensor.rs` — `read_metadata` (`:420`)
-- PoCs and verification harnesses: `audit/slice-reversed-bounds-overflow/`,
-  `audit/buffer-length-overflow/`, and the `fuzz_slice` target under
-  `safetensors/fuzz/`.
+- PR #809 — https://github.com/safetensors/safetensors/pull/809 (sibling
+  `usize::MAX`-index fix; see "Relationship to PR #809")
