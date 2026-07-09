@@ -47,12 +47,19 @@ pip install numpy safetensors        # release wheel
 python repro.py                       # loads slice_panic.safetensors, slices [10:3]
 ```
 
-Observed (release):
+`repro.py` intentionally does not catch the error — it lets safetensors crash
+so the impact is explicit (unhandled exception, full traceback, non-zero exit).
+
+Observed (release wheel), exit code 1:
 
 ```
 file loads fine: {'bias': (16,), 'weight': (16, 16)}
 numpy  weight[10:3] -> (0, 16) (benign empty)
-safetensors weight[10:3] -> RAISED builtins.SystemError : Negative size passed to PyByteArray_FromStringAndSize
+safetensors weight[10:3] -> (expect crash below)
+Traceback (most recent call last):
+  File ".../repro.py", line 43, in <module>
+    f.get_slice("weight")[10:3]
+SystemError: Negative size passed to PyByteArray_FromStringAndSize
 ```
 
 Rust-API equivalent (release): `view.slice(10..3)` panics
