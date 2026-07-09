@@ -73,14 +73,15 @@ exports the *same* backdoored `state_dict` to safetensors, pickle (`.pt`), and
 GGUF, reloads each, and compares:
 
 ```
-format          size(B)  max|w-diff|  trigger→target   extra attack surface
+format          size(B)  max|w-diff|  trigger→target   what the container carries besides weights
 safetensors        1004    0.000e+00          100.0%   none
 pickle (.pt)       2923    0.000e+00          100.0%   ARBITRARY CODE EXEC on load
 gguf               1056    0.000e+00          100.0%   no code-exec; parser CVEs + metadata/template surface
+onnx               1186    0.000e+00          100.0%   GRAPH stored: architectural backdoor is IN-FILE + scannable (PAIT-ONNX-200)
 ```
 
 Identical weights (`max|w-diff| = 0`) and identical backdoor (100% forced
-target) in all three. The formats differ **only** in the surface they add *on
+target) in all four. The formats differ **only** in the surface they add *on
 top* of the weights:
 
 - **safetensors** — adds nothing; pure data, the minimal/safest container.
@@ -89,11 +90,18 @@ top* of the weights:
 - **GGUF** — pure-data by spec (no code-exec), but historically has had parser
   memory-safety CVEs, and its metadata KV (chat templates, tokenizer) is a
   separate behavioral-manipulation channel.
+- **ONNX** (added to the demo) — a *graph* container: the backdoor's parallel
+  path is written into the file, so the same payload is an **in-file,
+  scannable architectural backdoor** (ProtectAI PAIT-ONNX-200). This is the
+  format against which a backdoor is an in-scope, detectable bounty finding.
 
 Takeaway: switching container format (e.g. pickle → safetensors) removes the
 *code-execution* surface but does nothing about weight-encoded backdoors — that
-risk is format-independent, and safetensors' "safe" reputation can lull
-defenders into skipping the behavioral review that would catch it.
+risk is format-independent. Scope note: this is **not a safetensors defect**
+(the format's only promise, "no code execution on load", holds). It is
+reportable as a *vulnerability* only where the architecture ships in the file
+(ONNX/TF → PAIT-ONNX-200); for safetensors it is a threat-model / documentation
+point — untrusted weights still need behavioral review.
 
 Note on the PoC's extra neuron: it changes hidden dim 8→9, which only matters
 when the loader instantiates the matching shape (e.g. `from_pretrained` driven
